@@ -3,19 +3,63 @@ import re
 import numpy as np
 import os
 import tempfile
+import logging
+from typing import List, Tuple, Optional
 
+# Initialize logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def calculate_noise_threshold_ebur128(input_file, percentile=1):
+class FFmpegError(Exception):
+    """Custom exception for FFmpeg related errors."""
+    pass
+
+def _run_ffmpeg_command(command: List[str]) -> Tuple[str, str]:
+    """
+    Executes an FFmpeg command and returns the output and error.
+
+    Args:
+        command: The FFmpeg command as a list of strings.
+
+    Returns:
+        A tuple containing stdout and stderr as strings.
+
+    Raises:
+        FFmpegError: If the FFmpeg command fails (non-zero return code).
+    """
+    logging.debug(f"Executing FFmpeg command: {' '.join(command)}")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output_bytes, error_bytes = process.communicate()
+    output_text = output_bytes.decode("utf-8").strip()
+    error_text = error_bytes.decode("utf-8").strip()
+
+    if process.returncode != 0:
+        logging.error(f"FFmpeg command failed with return code {process.returncode}")
+        logging.error(f"Command: {' '.join(command)}")
+        logging.error(f"Error output:\n{error_text}")
+        raise FFmpegError(f"FFmpeg command failed: {error_text}")
+
+    return output_text, error_text
+
+def calculate_noise_threshold_ebur128(input_file: str, percentile: float = 1.0) -> Optional[float]:
     """
     Calculates a noise threshold based on the given percentile of EBU R128 momentary loudness (M) values.
 
     Args:
-        input_file (str): Path to the input file.
-        percentile (float): The percentile to use for the noise threshold (e.g., 1 for the 1st percentile).
+        input_file: Path to the input file.
+        percentile: The percentile to use for the noise threshold (e.g., 1.0 for the 1st percentile). Must be between 0 and 100.
 
     Returns:
-        float: The calculated noise threshold in dB, or None if an error occurred.
+        The calculated noise threshold in dB, or None if loudness information cannot be extracted.
+
+    Raises:
+        FileNotFoundError: If the input file does not exist.
+        ValueError: If the percentile is not within the valid range [0, 100].
+        FFmpegError: If there's an issue executing the FFmpeg command.
     """
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input file not found: {input_file}")
+    if not 0 <= percentile <= 100:
+        raise ValueError(f"Percentile must be between 0 and 100, but got {percentile}")
 
     command = [
         "ffmpeg",
@@ -24,40 +68,56 @@ def calculate_noise_threshold_ebur128(input_file, percentile=1):
         "-f", "null", "-"
     ]
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output, error = process.communicate()
-    output_text = error.decode("utf-8")
+    try:
+        _, error_text = _run_ffmpeg_command(command)
+    except FFmpegError as e:
+        logging.error(f"Error during EBU R128 loudness analysis: {e}")
+        return None # Or re-raise if you want to propagate the exception
 
     # Extract momentary loudness (M) values from FFmpeg output
     momentary_loudness_values = []
-    for line in output_text.splitlines():
+    for line in error_text.splitlines():
         if "M:" in line:
             match = re.search(r"M: ([-+]?\d+\.?\d*)", line)
             if match:
                 momentary_loudness_values.append(float(match.group(1)))
 
     if not momentary_loudness_values:
-        print("Error: Could not extract loudness information from FFmpeg output.")
+        logging.warning("Could not extract loudness information from FFmpeg output. Possibly no audio stream.")
         return None
 
     # Calculate the specified percentile
     threshold = np.percentile(momentary_loudness_values, percentile)
+    logging.info(f"Calculated noise threshold ({percentile}th percentile EBU R128 M): {threshold:.2f} dB")
     return threshold
 
 
-def detect_silence(input_file, noise_threshold, fps, silence_duration=0.1, frame_margin=2):
+def detect_silence(input_file: str, noise_threshold: float, silence_duration: float = 0.1, frame_margin: int = 2, fps: Optional[float] = None) -> List[Tuple[float, float]]:
     """
-    Detects silence in an audio/video file using FFmpeg, with a given noise threshold.
+    Detects silence in an audio/video file using FFmpeg with silencedetect filter.
 
     Args:
-        input_file (str): Path to the input file.
-        noise_threshold (float): The noise threshold in dB.
-        silence_duration (float): Minimum silence duration in seconds.
-        frame_margin (int): Number of frames to add before and after the detected silence.
+        input_file: Path to the input file.
+        noise_threshold: The noise threshold in dB.
+        silence_duration: Minimum silence duration in seconds.
+        frame_margin: Number of frames to add before and after the detected silence.
+        fps: Frame rate of the video. Required for frame margin calculation if not None.
 
     Returns:
-        list: A list of tuples, where each tuple contains the start and end times of a silence period.
+        A list of tuples, where each tuple contains the start and end times of a silence period in seconds.
+        Returns an empty list if no silence is detected or an error occurs.
+
+    Raises:
+        FileNotFoundError: If the input file does not exist.
+        ValueError: If silence_duration or frame_margin is invalid.
+        FFmpegError: If there's an issue executing the FFmpeg command.
     """
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input file not found: {input_file}")
+    if silence_duration <= 0:
+        raise ValueError(f"silence_duration must be positive, but got {silence_duration}")
+    if frame_margin < 0:
+        raise ValueError(f"frame_margin cannot be negative, but got {frame_margin}")
 
     command = [
         "ffmpeg",
@@ -66,14 +126,16 @@ def detect_silence(input_file, noise_threshold, fps, silence_duration=0.1, frame
         "-f", "null", "-"
     ]
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output, error = process.communicate()
-    output_text = error.decode("utf-8")
+    try:
+        _, error_text = _run_ffmpeg_command(command)
+    except FFmpegError as e:
+        logging.error(f"Error during silence detection: {e}")
+        return [] # Return empty list on error, or re-raise if you want to propagate the exception
 
     silence_start_times = []
     silence_end_times = []
 
-    for line in output_text.splitlines():
+    for line in error_text.splitlines():
         if "silence_start" in line:
             match = re.search(r"silence_start: (\d+\.?\d*)", line)
             if match:
@@ -84,28 +146,86 @@ def detect_silence(input_file, noise_threshold, fps, silence_duration=0.1, frame
                 silence_end_times.append(float(match.group(1)))
 
     # Combine start and end times into a list of tuples
-    silence_periods = []
+    silence_periods: List[Tuple[float, float]] = []
     for i in range(min(len(silence_start_times), len(silence_end_times))):
-        silence_periods.append((silence_start_times[i] + frame_margin/fps, silence_end_times[i] - frame_margin/fps))
+        start_time = silence_start_times[i]
+        end_time = silence_end_times[i]
+        if fps is not None:
+            start_time += frame_margin / fps
+            end_time -= frame_margin / fps
+        silence_periods.append((start_time, end_time))
 
+    logging.info(f"Detected {len(silence_periods)} silence periods.")
     return silence_periods
 
 
-def get_frame_rate(input_video):
+def get_frame_rate(input_video: str) -> float:
     """
-    Gets the frame rate of the video.
-    """
-    command = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", input_video]
-    result = subprocess.run(command, stdout=subprocess.PIPE, text=True)
-    return float(result.stdout.split("/")[0]) / float(result.stdout.split("/")[1])
+    Gets the frame rate of the video using ffprobe.
 
-def create_ffmpeg_speedup_filter(silences, speed_factor=2.0, fps=30):
+    Args:
+        input_video: Path to the input video file.
+
+    Returns:
+        The frame rate of the video as a float.
+
+    Raises:
+        FileNotFoundError: If the input video file does not exist.
+        FFmpegError: If there's an issue executing the ffprobe command or parsing the output.
+    """
+    if not os.path.exists(input_video):
+        raise FileNotFoundError(f"Input video file not found: {input_video}")
+
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        input_video
+    ]
+
+    try:
+        output_text, _ = _run_ffmpeg_command(command)
+    except FFmpegError as e:
+        raise FFmpegError(f"Error getting frame rate with ffprobe: {e}") from e
+
+    try:
+        rate_str = output_text.strip()
+        num_str, den_str = rate_str.split("/")
+        frame_rate = float(num_str) / float(den_str)
+        logging.debug(f"Frame rate detected: {frame_rate} fps")
+        return frame_rate
+    except ValueError as e:
+        logging.error(f"Could not parse frame rate from ffprobe output: {output_text}")
+        raise FFmpegError(f"Failed to parse frame rate: {e}") from e
+    except Exception as e:
+        logging.error(f"Unexpected error parsing frame rate: {e}")
+        raise FFmpegError(f"Unexpected error parsing frame rate: {e}") from e
+
+
+def create_ffmpeg_speedup_filter(silences: List[Tuple[float, float]], speed_factor: float = 2.0, fps: float = 30.0) -> str:
     """
     Generates the FFmpeg filter_complex command to speed up silent parts while keeping the rest of the video at normal speed.
+
+    Args:
+        silences: A list of silence periods, each as a tuple of (start_time, end_time) in seconds.
+        speed_factor: The speed-up factor for silent segments. Must be greater than 1.
+        fps: The frame rate of the video.
+
+    Returns:
+        The FFmpeg filter_complex string.
+
+    Raises:
+        ValueError: If speed_factor is not greater than 1 or fps is not positive.
     """
+    if speed_factor <= 1:
+        raise ValueError(f"speed_factor must be greater than 1, but got {speed_factor}")
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, but got {fps}")
+
     filter_commands = []
     concat_inputs = []
-    
     last_end = 0.0
     segment_count = 0
 
@@ -113,12 +233,12 @@ def create_ffmpeg_speedup_filter(silences, speed_factor=2.0, fps=30):
         # Normal-speed segment before the silence
         if start > last_end:
             filter_commands.append(
-                f"[0:v]trim=start={last_end}:end={start},setpts=(PTS-STARTPTS),fps={fps}[v{segment_count}];"
+                f"[0:v]trim=start={last_end}:end={start},setpts=PTS-STARTPTS,fps={fps}[v{segment_count}];"
                 f"[0:a]atrim=start={last_end}:end={start},asetpts=PTS-STARTPTS[a{segment_count}]"
             )
             concat_inputs.append(f"[v{segment_count}][a{segment_count}]")
             segment_count += 1
-        
+
         # Speed-up silent segment
         filter_commands.append(
             f"[0:v]trim=start={start}:end={end},setpts=(PTS-STARTPTS)/{speed_factor},fps={fps}[v{segment_count}];"
@@ -130,34 +250,45 @@ def create_ffmpeg_speedup_filter(silences, speed_factor=2.0, fps=30):
         last_end = end
 
     # Handle remaining part of the video
-    filter_commands.append(
-        f"[0:v]trim=start={last_end},setpts=(PTS-STARTPTS),fps={fps}[v{segment_count}];"
-        f"[0:a]atrim=start={last_end},asetpts=PTS-STARTPTS[a{segment_count}]"
-    )
-    concat_inputs.append(f"[v{segment_count}][a{segment_count}]")
-    
+    if last_end < float('inf'): # To handle cases where the last silence period doesn't reach the end of the video.
+        filter_commands.append(
+            f"[0:v]trim=start={last_end},setpts=PTS-STARTPTS,fps={fps}[v{segment_count}];"
+            f"[0:a]atrim=start={last_end},asetpts=PTS-STARTPTS[a{segment_count}]"
+        )
+        concat_inputs.append(f"[v{segment_count}][a{segment_count}]")
+
     # Concatenate all segments
-    concat_filter = f"{''.join(concat_inputs)}concat=n={segment_count+1}:v=1:a=1[outv][outa]"
+    concat_filter = f"{''.join(concat_inputs)}concat=n={segment_count + (1 if last_end < float('inf') else 0) }:v=1:a=1[outv][outa]"
 
     # Join all filter parts
     filter_complex = ";".join(filter_commands) + ";" + concat_filter
-
+    logging.debug(f"Generated filter_complex: {filter_complex}")
     return filter_complex
 
-def split_video(input_video, chunk_duration=300):
+
+def split_video(input_video: str, chunk_duration: int = 300) -> List[str]:
     """
     Splits the video into chunks.
 
     Args:
-        input_video (str): Path to the input video.
-        chunk_duration (int): Duration of each chunk in seconds (default: 300 seconds = 5 minutes).
+        input_video: Path to the input video.
+        chunk_duration: Duration of each chunk in seconds (default: 300 seconds = 5 minutes).
 
     Returns:
-        list: A list of paths to the chunk files.
+        A list of paths to the chunk files.
+
+    Raises:
+        FileNotFoundError: If the input video file does not exist.
+        ValueError: If chunk_duration is not positive.
+        FFmpegError: If there's an issue executing the FFmpeg command.
     """
+    if not os.path.exists(input_video):
+        raise FileNotFoundError(f"Input video file not found: {input_video}")
+    if chunk_duration <= 0:
+        raise ValueError(f"chunk_duration must be positive, but got {chunk_duration}")
+
     output_dir = os.path.join(os.path.abspath(os.path.dirname(input_video)), "chunks")
-    if not os.path.exists(output_dir):
-         os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True) # exist_ok=True to avoid error if directory exists
 
     output_pattern = os.path.join(output_dir, "chunk%03d.mp4")
 
@@ -171,26 +302,40 @@ def split_video(input_video, chunk_duration=300):
         "-reset_timestamps", "1", # Reset timestamps for proper concatenation
         output_pattern
     ]
-    subprocess.run(command)
+
+    try:
+        _run_ffmpeg_command(command)
+    except FFmpegError as e:
+        raise FFmpegError(f"Error splitting video: {e}") from e
 
     # Get list of chunk files
     chunk_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith("chunk") and f.endswith(".mp4")]
     chunk_files.sort()  # Ensure chunks are in the correct order
+    logging.info(f"Video split into {len(chunk_files)} chunks in {output_dir}")
     return chunk_files
 
 
-
-def merge_chunks(output_video):
+def merge_chunks(output_video: str) -> None:
     """
     Merges the processed chunk files back into a single video.
 
     Args:
-        output_video (str):  The path to save the merged video.
-    """
+        output_video: The path to save the merged video.
 
+    Raises:
+        FileNotFoundError: If the chunks directory does not exist or no chunk files are found.
+        FFmpegError: If there's an issue executing the FFmpeg command for merging.
+    """
     chunks_dir = os.path.join(os.path.abspath(os.path.dirname(output_video)), "chunks")
+    if not os.path.exists(chunks_dir):
+        raise FileNotFoundError(f"Chunks directory not found: {chunks_dir}")
+
     chunk_files = [os.path.join(chunks_dir, f) for f in os.listdir(chunks_dir) if f.startswith("chunk") and f.endswith(".mp4")]
     chunk_files.sort()  # Very important to sort!
+
+    if not chunk_files:
+        raise FileNotFoundError(f"No chunk files found in {chunks_dir}")
+
 
     # Create a text file listing the chunk files for FFmpeg
     list_file_path = os.path.join(chunks_dir, "chunks_list.txt")
@@ -208,72 +353,89 @@ def merge_chunks(output_video):
         output_video
     ]
 
-    subprocess.run(command)
-    print(f"Merged video saved to: {output_video}")
-    # Clean up the temporary list file.  We leave the chunks for debugging.
-    os.remove(list_file_path)
+    try:
+        _run_ffmpeg_command(command)
+    except FFmpegError as e:
+        raise FFmpegError(f"Error merging chunks: {e}") from e
 
+    logging.info(f"Merged video saved to: {output_video}")
+    # Clean up the temporary list file. We leave the chunks for debugging.
+    os.remove(list_file_path)
 
 
 if __name__ == "__main__":
     input_video = "./assets/input.mp4"  # Replace with your video file
     output_video = "./assets/output.mp4"
 
+    try:
+        chunk_files = split_video(input_video)
 
-    chunk_files = split_video(input_video)
+        processed_chunks = []
+        for chunk_file in chunk_files:
+            try:
+                # Calculate the noise threshold (30th percentile) using EBU R128 momentary loudness
+                noise_threshold = calculate_noise_threshold_ebur128(chunk_file, percentile=30)
 
-    processed_chunks = []
-    for chunk_file in chunk_files:
-        # Calculate the noise threshold (1st percentile) using EBU R128 momentary loudness
-        noise_threshold = calculate_noise_threshold_ebur128(chunk_file, percentile=30)
+                if noise_threshold is not None:
+                    logging.info(f"Processing chunk: {chunk_file}")
+                    logging.info(f"Calculated noise threshold (EBU R128 M): {noise_threshold:.2f} dB")
 
-        if noise_threshold is not None:
-            print(f"Calculated noise threshold (EBU R128 M): {noise_threshold:.2f} dB for {chunk_file}")
-            
-            fps = get_frame_rate(chunk_file)
-            # Detect silence using the calculated threshold
-            silence = detect_silence(chunk_file, noise_threshold, silence_duration=0.35, fps=fps)
+                    fps = get_frame_rate(chunk_file)
+                    # Detect silence using the calculated threshold
+                    silence = detect_silence(chunk_file, noise_threshold, silence_duration=0.35, fps=fps)
 
-            if silence:
-                # print(f"Silence periods detected in {chunk_file}:")
-                # for start, end in silence:
-                #     print(f"Start: {start:.3f}s, End: {end:.3f}s, Duration: {end - start:.3f}s")
+                    if silence:
+                        logging.info(f"Silence periods detected: {silence}")
 
-                
-                filter_complex = create_ffmpeg_speedup_filter(silence, speed_factor=10, fps=fps)
+                        filter_complex = create_ffmpeg_speedup_filter(silence, speed_factor=10, fps=fps)
 
-                # Save filter_complex to a file
-                filter_complex_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-                with open(filter_complex_file.name, "w") as f:
-                    f.write(filter_complex)
+                        # Save filter_complex to a file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as filter_complex_file:
+                            filter_complex_file.write(filter_complex.encode('utf-8'))
+                            filter_complex_file_name = filter_complex_file.name # Capture name before closing
 
-                # Use a temporary output file for the processed chunk
-                temp_output_file = os.path.join(os.path.abspath(os.path.dirname(chunk_file)), "temp_" + os.path.basename(chunk_file))
+                        # Use a temporary output file for the processed chunk
+                        temp_output_file = os.path.join(os.path.abspath(os.path.dirname(chunk_file)), "temp_" + os.path.basename(chunk_file))
 
-                # Apply the filter_complex
-                command = [
-                    "ffmpeg",
-                    "-i", chunk_file,
-                    "-filter_complex_script", filter_complex_file.name,
-                    "-map", "[outv]",
-                    "-map", "[outa]",
-                    temp_output_file
-                ]
-                subprocess.run(command)
+                        # Apply the filter_complex
+                        command = [
+                            "ffmpeg",
+                            "-i", chunk_file,
+                            "-filter_complex", filter_complex_file_name,
+                            "-map", "[outv]",
+                            "-map", "[outa]",
+                            temp_output_file
+                        ]
+                        _run_ffmpeg_command(command)
 
-                # Replace original chunk with the processed one
-                os.remove(chunk_file)
-                os.rename(temp_output_file, chunk_file) # Rename temp file to overwrite the original
+                        # Replace original chunk with the processed one
+                        os.remove(chunk_file)
+                        os.rename(temp_output_file, chunk_file) # Rename temp file to overwrite the original
 
-                os.remove(filter_complex_file.name) # Clean up the temp filter file
+                        os.remove(filter_complex_file_name) # Clean up the temp filter file
 
+                    else:
+                        logging.info(f"No silence detected in {chunk_file}.")
 
-            else:
-                print(f"No silence detected in {chunk_file}.")
+                else:
+                    logging.warning(f"Could not calculate noise threshold for {chunk_file}. Skipping speedup for this chunk.")
 
-        else:
-            print(f"Could not calculate noise threshold for {chunk_file}. Check FFmpeg output.")
+            except FFmpegError as e:
+                logging.error(f"FFmpeg processing error for chunk {chunk_file}: {e}")
+            except Exception as e:
+                logging.error(f"An unexpected error occurred while processing chunk {chunk_file}: {e}", exc_info=True)
 
 
-    # Merge all processed chunk files:
-    merge_chunks(output_video)
+        # Merge all processed chunk files:
+        merge_chunks(output_video)
+
+        logging.info(f"Processing complete. Output video: {output_video}")
+
+    except FileNotFoundError as e:
+        logging.error(f"File not found error: {e}")
+    except ValueError as e:
+        logging.error(f"Value error: {e}")
+    except FFmpegError as e:
+        logging.error(f"FFmpeg general error: {e}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in main execution: {e}", exc_info=True)
