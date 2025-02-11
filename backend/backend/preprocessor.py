@@ -4,6 +4,7 @@ import numpy as np
 import os
 import tempfile
 
+
 def calculate_noise_threshold_ebur128(input_file, percentile=1):
     """
     Calculates a noise threshold based on the given percentile of EBU R128 momentary loudness (M) values.
@@ -44,7 +45,7 @@ def calculate_noise_threshold_ebur128(input_file, percentile=1):
     return threshold
 
 
-def detect_silence(input_file, noise_threshold, silence_duration=0.1):
+def detect_silence(input_file, noise_threshold, fps, silence_duration=0.1, frame_margin=2):
     """
     Detects silence in an audio/video file using FFmpeg, with a given noise threshold.
 
@@ -52,6 +53,7 @@ def detect_silence(input_file, noise_threshold, silence_duration=0.1):
         input_file (str): Path to the input file.
         noise_threshold (float): The noise threshold in dB.
         silence_duration (float): Minimum silence duration in seconds.
+        frame_margin (int): Number of frames to add before and after the detected silence.
 
     Returns:
         list: A list of tuples, where each tuple contains the start and end times of a silence period.
@@ -84,7 +86,7 @@ def detect_silence(input_file, noise_threshold, silence_duration=0.1):
     # Combine start and end times into a list of tuples
     silence_periods = []
     for i in range(min(len(silence_start_times), len(silence_end_times))):
-        silence_periods.append((silence_start_times[i], silence_end_times[i]))
+        silence_periods.append((silence_start_times[i] + frame_margin/fps, silence_end_times[i] - frame_margin/fps))
 
     return silence_periods
 
@@ -142,55 +144,136 @@ def create_ffmpeg_speedup_filter(silences, speed_factor=2.0, fps=30):
 
     return filter_complex
 
-def split_video(input_video):
+def split_video(input_video, chunk_duration=300):
     """
-    Splits the video into 5 minutes chunks.
+    Splits the video into chunks.
+
+    Args:
+        input_video (str): Path to the input video.
+        chunk_duration (int): Duration of each chunk in seconds (default: 300 seconds = 5 minutes).
+
+    Returns:
+        list: A list of paths to the chunk files.
     """
-    command = ["ffmpeg", "-i", input_video, "-c", "copy", "-map", "0", "-segment_time", "300", "-f", "segment", "./assets/output%03d.mp4"]
+    output_dir = os.path.join(os.path.abspath(os.path.dirname(input_video)), "chunks")
+    if not os.path.exists(output_dir):
+         os.makedirs(output_dir)
+
+    output_pattern = os.path.join(output_dir, "chunk%03d.mp4")
+
+    command = [
+        "ffmpeg",
+        "-i", input_video,
+        "-c", "copy",  # Use stream copying for faster processing
+        "-map", "0",
+        "-segment_time", str(chunk_duration),
+        "-f", "segment",
+        "-reset_timestamps", "1", # Reset timestamps for proper concatenation
+        output_pattern
+    ]
     subprocess.run(command)
+
+    # Get list of chunk files
+    chunk_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith("chunk") and f.endswith(".mp4")]
+    chunk_files.sort()  # Ensure chunks are in the correct order
+    return chunk_files
+
+
+
+def merge_chunks(output_video):
+    """
+    Merges the processed chunk files back into a single video.
+
+    Args:
+        output_video (str):  The path to save the merged video.
+    """
+
+    chunks_dir = os.path.join(os.path.abspath(os.path.dirname(output_video)), "chunks")
+    chunk_files = [os.path.join(chunks_dir, f) for f in os.listdir(chunks_dir) if f.startswith("chunk") and f.endswith(".mp4")]
+    chunk_files.sort()  # Very important to sort!
+
+    # Create a text file listing the chunk files for FFmpeg
+    list_file_path = os.path.join(chunks_dir, "chunks_list.txt")
+    with open(list_file_path, "w") as f:
+        for chunk in chunk_files:
+            f.write(f"file '{chunk}'\n")
+
+    # Use FFmpeg concat demuxer to merge the chunks
+    command = [
+        "ffmpeg",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file_path,
+        "-c", "copy",  # Use stream copying (fast)
+        output_video
+    ]
+
+    subprocess.run(command)
+    print(f"Merged video saved to: {output_video}")
+    # Clean up the temporary list file.  We leave the chunks for debugging.
+    os.remove(list_file_path)
 
 
 
 if __name__ == "__main__":
     input_video = "./assets/input.mp4"  # Replace with your video file
+    output_video = "./assets/output.mp4"
 
 
+    chunk_files = split_video(input_video)
 
-    # Calculate the noise threshold (1st percentile) using EBU R128 momentary loudness
-    noise_threshold = calculate_noise_threshold_ebur128(input_video, percentile=30)
+    processed_chunks = []
+    for chunk_file in chunk_files:
+        # Calculate the noise threshold (1st percentile) using EBU R128 momentary loudness
+        noise_threshold = calculate_noise_threshold_ebur128(chunk_file, percentile=30)
 
-    if noise_threshold is not None:
-        print(f"Calculated noise threshold (EBU R128 M): {noise_threshold:.2f} dB")
+        if noise_threshold is not None:
+            print(f"Calculated noise threshold (EBU R128 M): {noise_threshold:.2f} dB for {chunk_file}")
+            
+            fps = get_frame_rate(chunk_file)
+            # Detect silence using the calculated threshold
+            silence = detect_silence(chunk_file, noise_threshold, silence_duration=0.35, fps=fps)
 
-        # Detect silence using the calculated threshold
-        silence = detect_silence(input_video, noise_threshold, silence_duration=0.35)
+            if silence:
+                # print(f"Silence periods detected in {chunk_file}:")
+                # for start, end in silence:
+                #     print(f"Start: {start:.3f}s, End: {end:.3f}s, Duration: {end - start:.3f}s")
 
-        if silence:
-            print("Silence periods detected:")
-            for start, end in silence:
-                print(f"Start: {start:.3f}s, End: {end:.3f}s, Duration: {end - start:.3f}s")
+                
+                filter_complex = create_ffmpeg_speedup_filter(silence, speed_factor=10, fps=fps)
 
-            fps = get_frame_rate(input_video)
-            filter_complex = create_ffmpeg_speedup_filter(silence, speed_factor=10, fps=fps)
+                # Save filter_complex to a file
+                filter_complex_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+                with open(filter_complex_file.name, "w") as f:
+                    f.write(filter_complex)
 
-            # Save filter_complex to a file
-            filter_complex_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-            with open(filter_complex_file.name, "w") as f:
-                f.write(filter_complex)
+                # Use a temporary output file for the processed chunk
+                temp_output_file = os.path.join(os.path.abspath(os.path.dirname(chunk_file)), "temp_" + os.path.basename(chunk_file))
 
-            # Apply the filter_complex to speed up silent parts
-            if os.path.exists(filter_complex_file.name):
-
-    
+                # Apply the filter_complex
                 command = [
-                    "ffmpeg", "-i", input_video, "-filter_complex_script", os.path.join(filter_complex_file.name),
-                    "-map", "[outv]", "-map", "[outa]", "./assets/output.mp4"
+                    "ffmpeg",
+                    "-i", chunk_file,
+                    "-filter_complex_script", filter_complex_file.name,
+                    "-map", "[outv]",
+                    "-map", "[outa]",
+                    temp_output_file
                 ]
-            
                 subprocess.run(command)
-            
-            # os.remove("./assets/filter_complex.txt")
+
+                # Replace original chunk with the processed one
+                os.remove(chunk_file)
+                os.rename(temp_output_file, chunk_file) # Rename temp file to overwrite the original
+
+                os.remove(filter_complex_file.name) # Clean up the temp filter file
+
+
+            else:
+                print(f"No silence detected in {chunk_file}.")
+
         else:
-            print("No silence detected.")
-    else:
-        print("Could not calculate noise threshold. Check FFmpeg output.")
+            print(f"Could not calculate noise threshold for {chunk_file}. Check FFmpeg output.")
+
+
+    # Merge all processed chunk files:
+    merge_chunks(output_video)
