@@ -48,7 +48,7 @@ def _run_ffmpeg_command(command: List[str]) -> Tuple[str, str]:
 
 
 def calculate_noise_threshold_ebur128(
-    input_file: str, percentile: float = 1.0
+    input_file: str, percentile: float = 30.0
 ) -> Optional[float]:
     """
     Calculates a noise threshold based on the given percentile of EBU R128 momentary loudness (M) values.
@@ -112,7 +112,7 @@ def calculate_noise_threshold_ebur128(
 def detect_silence(
     input_file: str,
     noise_threshold: float,
-    silence_duration: float = 0.1,
+    silence_duration: float = 0.35,
     frame_margin: int = 2,
     fps: Optional[float] = None,
 ) -> List[Tuple[float, float]]:
@@ -238,7 +238,7 @@ def get_frame_rate(input_video: str) -> float:
 
 
 def create_ffmpeg_speedup_filter(
-    silences: List[Tuple[float, float]], speed_factor: float = 2.0, fps: float = 30.0
+    silences: List[Tuple[float, float]], speed_factor: float = 5.0, fps: float = 30.0
 ) -> str:
     """
     Generates the FFmpeg filter_complex command to speed up silent parts while keeping the rest of the video at normal speed.
