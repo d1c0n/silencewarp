@@ -431,7 +431,6 @@ def process_video_silence_speedup(
 ):
     """
     Processes the video to speed up silences.
-    This function encapsulates the core logic and is used by both CLI and API.
     """
     # Create a main temporary directory for all processing if not provided
     if temp_dir is None:
