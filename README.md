@@ -2,7 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/silencewarp.svg)](https://badge.fury.io/py/silencewarp)
 
-**silencewarp** is a Python package that utilizes FFmpeg to automatically speed up silent portions of video files. This can be useful for reducing video length and improving viewer engagement by removing unnecessary pauses.
+**silencewarp** is a Python package that utilizes FFmpeg to automatically speed up silent portions of video files. This can be useful for reducing video length and improving viewer engagement by renmoving unnecessary pauses but still allowing viewers to follow what's happening by avoiding abrupt cuts.
 
 ## Features
 
