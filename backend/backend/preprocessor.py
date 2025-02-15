@@ -5,6 +5,9 @@ import os
 import tempfile
 import logging
 from typing import List, Tuple, Optional
+import argparse
+from flask import Flask, request, send_file, jsonify
+from werkzeug.utils import secure_filename
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,7 +39,7 @@ def _run_ffmpeg_command(command: List[str]) -> Tuple[str, str]:
         logging.error(f"FFmpeg command failed with return code {process.returncode}")
         logging.error(f"Command: {' '.join(command)}")
         logging.error(f"Error output:\n{error_text}")
-        raise FFmpegError(f"FFmpeg command failed: {error_text}")
+        # raise FFmpegError(f"FFmpeg command failed: {error_text}")
 
     return output_text, error_text
 
@@ -266,7 +269,7 @@ def create_ffmpeg_speedup_filter(silences: List[Tuple[float, float]], speed_fact
     return filter_complex
 
 
-def split_video(input_video: str, chunk_duration: int = 300) -> List[str]:
+def split_video(input_video: str, chunk_duration: int = 60) -> List[str]:
     """
     Splits the video into chunks.
 
@@ -362,19 +365,19 @@ def merge_chunks(output_video: str) -> None:
     # Clean up the temporary list file. We leave the chunks for debugging.
     os.remove(list_file_path)
 
-
-if __name__ == "__main__":
-    input_video = "./assets/input.mp4"  # Replace with your video file
-    output_video = "./assets/output.mp4"
-
+def process_video_silence_speedup(input_video, output_video, percentile=30, silence_duration=0.35, speed_factor=10):
+    """
+    Processes the video to speed up silences.
+    This function encapsulates the core logic and is used by both CLI and API.
+    """
     try:
         chunk_files = split_video(input_video)
 
         processed_chunks = []
         for chunk_file in chunk_files:
             try:
-                # Calculate the noise threshold (30th percentile) using EBU R128 momentary loudness
-                noise_threshold = calculate_noise_threshold_ebur128(chunk_file, percentile=30)
+                # Calculate the noise threshold (percentile) using EBU R128 momentary loudness
+                noise_threshold = calculate_noise_threshold_ebur128(chunk_file, percentile=percentile)
 
                 if noise_threshold is not None:
                     logging.info(f"Processing chunk: {chunk_file}")
@@ -382,12 +385,12 @@ if __name__ == "__main__":
 
                     fps = get_frame_rate(chunk_file)
                     # Detect silence using the calculated threshold
-                    silence = detect_silence(chunk_file, noise_threshold, silence_duration=0.35, fps=fps)
+                    silence = detect_silence(chunk_file, noise_threshold, silence_duration=silence_duration, fps=fps)
 
                     if silence:
                         logging.info(f"Silence periods detected: {silence}")
 
-                        filter_complex = create_ffmpeg_speedup_filter(silence, speed_factor=10, fps=fps)
+                        filter_complex = create_ffmpeg_speedup_filter(silence, speed_factor=speed_factor, fps=fps)
 
                         # Save filter_complex to a file
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as filter_complex_file:
@@ -401,7 +404,7 @@ if __name__ == "__main__":
                         command = [
                             "ffmpeg",
                             "-i", chunk_file,
-                            "-filter_complex", filter_complex_file_name,
+                            "-filter_complex_script", filter_complex_file_name, # Use -filter_complex for readability and avoiding command line length limits
                             "-map", "[outv]",
                             "-map", "[outa]",
                             temp_output_file
@@ -429,13 +432,106 @@ if __name__ == "__main__":
         # Merge all processed chunk files:
         merge_chunks(output_video)
 
+        # Clean up the chunks directory
+        chunks_dir = os.path.join(os.path.abspath(os.path.dirname(output_video)), "chunks")
+        for chunk_file in os.listdir(chunks_dir):
+            os.remove(os.path.join(chunks_dir, chunk_file))
+        os.rmdir(chunks_dir)
+
         logging.info(f"Processing complete. Output video: {output_video}")
+        return output_video # Return output path for API
 
     except FileNotFoundError as e:
         logging.error(f"File not found error: {e}")
+        raise
     except ValueError as e:
         logging.error(f"Value error: {e}")
+        raise
     except FFmpegError as e:
         logging.error(f"FFmpeg general error: {e}")
+        raise
     except Exception as e:
         logging.error(f"An unexpected error occurred in main execution: {e}", exc_info=True)
+        raise
+
+
+# --- CLI Application ---
+def cli_main():
+    parser = argparse.ArgumentParser(description="Speed up silences in video using FFmpeg.")
+    parser.add_argument("input_video", help="Path to the input video file.")
+    parser.add_argument("output_video", help="Path to the output video file.")
+    parser.add_argument("--percentile", type=float, default=30, help="Percentile for noise threshold calculation (default: 30).")
+    parser.add_argument("--silence_duration", type=float, default=0.35, help="Minimum silence duration in seconds (default: 0.35).")
+    parser.add_argument("--speed_factor", type=float, default=10, help="Speed-up factor for silent segments (default: 10).")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.debug("Debug logging enabled.")
+    
+    
+
+    try:
+        process_video_silence_speedup(args.input_video, args.output_video, args.percentile, args.silence_duration, args.speed_factor)
+    except Exception as e:
+        logging.error(f"Error processing video: {e}")
+        exit(1)
+
+# --- Web API (Flask) ---
+app = Flask(__name__)
+UPLOAD_FOLDER = 'uploads' # Directory to store uploaded files
+ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv'} # Allowed video file extensions
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True) # Ensure upload folder exists
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/speedup_silences', methods=['POST'])
+def speedup_silences_api():
+    if 'video' not in request.files:
+        return jsonify({'error': 'No video file part'}), 400
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({'error': 'No selected video file'}), 400
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        input_video_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(input_video_path)
+
+        percentile = float(request.form.get('percentile', 30)) # Get from form data, default 30
+        silence_duration = float(request.form.get('silence_duration', 0.35))
+        speed_factor = float(request.form.get('speed_factor', 10))
+
+        try:
+            # Create a temporary output file in the same directory as input for simplicity
+            output_filename = "processed_" + filename
+            output_video_path = os.path.join(app.config['UPLOAD_FOLDER'], output_filename)
+            processed_video_path = process_video_silence_speedup(input_video_path, output_video_path, percentile, silence_duration, speed_factor)
+
+            if processed_video_path:
+                return send_file(os.path.join(app.config['UPLOAD_FOLDER'], output_filename), as_attachment=True, download_name=output_filename) # Send processed video as download
+            else:
+                return jsonify({'error': 'Video processing failed, but no specific error returned'}), 500
+
+        except Exception as e:
+            os.remove(input_video_path) # Clean up uploaded file even on error
+            logging.error(f"API processing error: {e}")
+            return jsonify({'error': str(e)}), 500
+        # finally:
+            # os.remove(input_video_path) # Clean up uploaded file after processing (success or failure)
+            # Optionally, keep processed file for download and handle cleanup later
+
+    else:
+        return jsonify({'error': 'Invalid file type'}), 400
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        cli_main() # Run as CLI if arguments are provided
+    else:
+        app.run(debug=True) # Run Flask app if no arguments (for API)
