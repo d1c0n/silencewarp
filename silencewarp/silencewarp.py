@@ -263,6 +263,19 @@ def create_ffmpeg_speedup_filter(
     last_end = 0.0
     segment_count = 0
 
+    # Break a speed_factor > 2 in multiple atempo filters of max 2x speed
+    # This is done to avoid memory issues with FFMPEG at higher speed factors
+    audio_speed_factor = speed_factor
+    if speed_factor > 2:
+        speed_factor_parts = []
+        while audio_speed_factor > 2:
+            speed_factor_parts.append(2)
+            audio_speed_factor /= 2
+        speed_factor_parts.append(audio_speed_factor)
+        logging.debug(f"Speed factor parts: {speed_factor_parts}")
+
+    atempo_filter = ",".join([f"atempo={part}" for part in speed_factor_parts])
+
     for i, (start, end) in enumerate(silences):
         # Normal-speed segment before the silence
         if start > last_end:
@@ -276,7 +289,7 @@ def create_ffmpeg_speedup_filter(
         # Speed-up silent segment
         filter_commands.append(
             f"[0:v]trim=start={start}:end={end},setpts=(PTS-STARTPTS)/{speed_factor}[v{segment_count}];"
-            f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,atempo={speed_factor}[a{segment_count}]"
+            f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,{atempo_filter}[a{segment_count}]"
         )
         concat_inputs.append(f"[v{segment_count}][a{segment_count}]")
         segment_count += 1
