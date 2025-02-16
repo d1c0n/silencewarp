@@ -267,7 +267,7 @@ def create_ffmpeg_speedup_filter(
         # Normal-speed segment before the silence
         if start > last_end:
             filter_commands.append(
-                f"[0:v]trim=start={last_end}:end={start},setpts=PTS-STARTPTS,fps={fps}[v{segment_count}];"
+                f"[0:v]trim=start={last_end}:end={start},setpts=PTS-STARTPTS[v{segment_count}];"
                 f"[0:a]atrim=start={last_end}:end={start},asetpts=PTS-STARTPTS[a{segment_count}]"
             )
             concat_inputs.append(f"[v{segment_count}][a{segment_count}]")
@@ -275,7 +275,7 @@ def create_ffmpeg_speedup_filter(
 
         # Speed-up silent segment
         filter_commands.append(
-            f"[0:v]trim=start={start}:end={end},setpts=(PTS-STARTPTS)/{speed_factor},fps={fps}[v{segment_count}];"
+            f"[0:v]trim=start={start}:end={end},setpts=(PTS-STARTPTS)/{speed_factor}[v{segment_count}];"
             f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,atempo={speed_factor}[a{segment_count}]"
         )
         concat_inputs.append(f"[v{segment_count}][a{segment_count}]")
@@ -288,7 +288,7 @@ def create_ffmpeg_speedup_filter(
         last_end < float("inf")
     ):  # To handle cases where the last silence period doesn't reach the end of the video.
         filter_commands.append(
-            f"[0:v]trim=start={last_end},setpts=PTS-STARTPTS,fps={fps}[v{segment_count}];"
+            f"[0:v]trim=start={last_end},setpts=PTS-STARTPTS[v{segment_count}];"
             f"[0:a]atrim=start={last_end},asetpts=PTS-STARTPTS[a{segment_count}]"
         )
         concat_inputs.append(f"[v{segment_count}][a{segment_count}]")
@@ -297,7 +297,9 @@ def create_ffmpeg_speedup_filter(
     concat_filter = f"{''.join(concat_inputs)}concat=n={segment_count + (1 if last_end < float('inf') else 0)}:v=1:a=1[outv][outa]"
 
     # Join all filter parts
-    filter_complex = ";".join(filter_commands) + ";" + concat_filter
+    filter_complex = (
+        ";".join(filter_commands) + ";" + concat_filter + f";[outv]fps={fps}[outv]"
+    )
     logging.debug(f"Generated filter_complex: {filter_complex}")
     return filter_complex
 
