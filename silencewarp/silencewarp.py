@@ -1,15 +1,14 @@
 import subprocess
 import re
 import numpy as np
-import os
 import tempfile
 import logging
 from typing import List, Tuple, Optional
-
+from pathlib import Path
 
 # Initialize logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 
@@ -48,7 +47,7 @@ def _run_ffmpeg_command(command: List[str]) -> Tuple[str, str]:
 
 
 def calculate_noise_threshold_ebur128(
-    input_file: str, percentile: float = 30.0
+    input_file: Path, percentile: float = 30.0
 ) -> Optional[float]:
     """
     Calculates a noise threshold based on the given percentile of EBU R128 momentary loudness (M) values.
@@ -65,7 +64,7 @@ def calculate_noise_threshold_ebur128(
         ValueError: If the percentile is not within the valid range [0, 100].
         FFmpegError: If there's an issue executing the FFmpeg command.
     """
-    if not os.path.exists(input_file):
+    if not input_file.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
     if not 0 <= percentile <= 100:
         raise ValueError(f"Percentile must be between 0 and 100, but got {percentile}")
@@ -73,7 +72,7 @@ def calculate_noise_threshold_ebur128(
     command = [
         "ffmpeg",
         "-i",
-        input_file,
+        str(input_file),  # Convert Path to string for ffmpeg command
         "-af",
         "ebur128",  # Use ebur128 filter and enable metadata output
         "-f",
@@ -110,7 +109,7 @@ def calculate_noise_threshold_ebur128(
 
 
 def detect_silence(
-    input_file: str,
+    input_file: Path,
     noise_threshold: float,
     silence_duration: float = 0.35,
     frame_margin: int = 2,
@@ -135,7 +134,7 @@ def detect_silence(
         ValueError: If silence_duration or frame_margin is invalid.
         FFmpegError: If there's an issue executing the FFmpeg command.
     """
-    if not os.path.exists(input_file):
+    if not input_file.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
     if silence_duration <= 0:
         raise ValueError(
@@ -147,7 +146,7 @@ def detect_silence(
     command = [
         "ffmpeg",
         "-i",
-        input_file,
+        str(input_file),  # Convert Path to string for ffmpeg command
         "-af",
         f"silencedetect=noise={noise_threshold}dB:d={silence_duration}",
         "-f",
@@ -188,7 +187,7 @@ def detect_silence(
     return silence_periods
 
 
-def get_frame_rate(input_video: str) -> float:
+def get_frame_rate(input_video: Path) -> float:
     """
     Gets the frame rate of the video using ffprobe.
 
@@ -202,7 +201,7 @@ def get_frame_rate(input_video: str) -> float:
         FileNotFoundError: If the input video file does not exist.
         FFmpegError: If there's an issue executing the ffprobe command or parsing the output.
     """
-    if not os.path.exists(input_video):
+    if not input_video.exists():
         raise FileNotFoundError(f"Input video file not found: {input_video}")
 
     command = [
@@ -215,7 +214,7 @@ def get_frame_rate(input_video: str) -> float:
         "stream=r_frame_rate",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
-        input_video,
+        str(input_video),  # Convert Path to string for ffprobe command
     ]
 
     try:
@@ -304,8 +303,8 @@ def create_ffmpeg_speedup_filter(
 
 
 def split_video(
-    input_video: str, chunk_duration: int = 60, temp_dir: str = None
-) -> List[str]:
+    input_video: Path, chunk_duration: int = 60, temp_dir: Optional[str] = None
+) -> List[Path]:
     """
     Splits the video into chunks within a temporary directory.
 
@@ -322,25 +321,27 @@ def split_video(
         ValueError: If chunk_duration is not positive.
         FFmpegError: If there's an issue executing the FFmpeg command.
     """
-    if not os.path.exists(input_video):
+    if not input_video.exists():
         raise FileNotFoundError(f"Input video file not found: {input_video}")
     if chunk_duration <= 0:
         raise ValueError(f"chunk_duration must be positive, but got {chunk_duration}")
 
     if temp_dir is None:
-        temp_dir = tempfile.gettempdir()  # Use system temp dir if not provided
+        temp_dir_path = Path(tempfile.gettempdir())  # Use Path for temp dir
+    else:
+        temp_dir_path = Path(temp_dir)
 
-    chunks_dir = os.path.join(
-        temp_dir, "video_chunks"
+    chunks_dir = (
+        temp_dir_path / "video_chunks"
     )  # Create chunks directory inside temp dir
-    os.makedirs(chunks_dir, exist_ok=True)
+    chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    output_pattern = os.path.join(chunks_dir, "chunk%03d.mp4")
+    output_pattern = str(chunks_dir / "chunk%03d.mp4")  # Path for output pattern
 
     command = [
         "ffmpeg",
         "-i",
-        input_video,
+        str(input_video),  # Convert Path to string for ffmpeg command
         "-c",
         "copy",  # Use stream copying for faster processing
         "-map",
@@ -361,16 +362,16 @@ def split_video(
 
     # Get list of chunk files
     chunk_files = [
-        os.path.join(chunks_dir, f)
-        for f in os.listdir(chunks_dir)
-        if f.startswith("chunk") and f.endswith(".mp4")
+        chunk_file
+        for chunk_file in chunks_dir.iterdir()
+        if chunk_file.name.startswith("chunk") and chunk_file.name.endswith(".mp4")
     ]
     chunk_files.sort()  # Ensure chunks are in the correct order
     logging.info(f"Video split into {len(chunk_files)} chunks in {chunks_dir}")
     return chunk_files
 
 
-def merge_chunks(chunk_files: List[str], output_video: str) -> None:
+def merge_chunks(chunk_files: List[Path], output_video: Path) -> None:
     """
     Merges the processed chunk files back into a single video.
 
@@ -387,12 +388,12 @@ def merge_chunks(chunk_files: List[str], output_video: str) -> None:
 
     # Create a temporary directory for the list file (in system temp)
     temp_list_dir = tempfile.mkdtemp()
-    list_file_path = os.path.join(temp_list_dir, "chunks_list.txt")
+    list_file_path = Path(temp_list_dir) / "chunks_list.txt"
 
     try:
         with open(list_file_path, "w") as f:
             for chunk in chunk_files:
-                f.write(f"file '{chunk}'\n")
+                f.write(f"file '{str(chunk)}'\n")  # Convert Path to string in list file
 
         # Use FFmpeg concat demuxer to merge the chunks
         command = [
@@ -402,10 +403,10 @@ def merge_chunks(chunk_files: List[str], output_video: str) -> None:
             "-safe",
             "0",
             "-i",
-            list_file_path,
+            str(list_file_path),  # Convert Path to string for ffmpeg command
             "-c",
             "copy",  # Use stream copying (fast)
-            output_video,
+            str(output_video),  # Convert Path to string for ffmpeg command
         ]
 
         try:
@@ -417,13 +418,13 @@ def merge_chunks(chunk_files: List[str], output_video: str) -> None:
 
     finally:  # Ensure cleanup even if errors occur
         # Clean up the temporary list file and directory
-        os.remove(list_file_path)
-        os.rmdir(temp_list_dir)
+        list_file_path.unlink()
+        Path(temp_list_dir).rmdir()
 
 
 def process_video_silence_speedup(
-    input_video,
-    output_video,
+    input_video: Path,
+    output_video: Path,
     percentile=30,
     silence_duration=0.35,
     speed_factor=10,
@@ -435,8 +436,9 @@ def process_video_silence_speedup(
     # Create a main temporary directory for all processing if not provided
     if temp_dir is None:
         with (
-            tempfile.TemporaryDirectory() as main_temp_dir
+            tempfile.TemporaryDirectory() as main_temp_dir_str
         ):  # Context manager for auto cleanup
+            main_temp_dir = Path(main_temp_dir_str)
             return _process_video_with_temp_dir(
                 input_video,
                 output_video,
@@ -446,26 +448,33 @@ def process_video_silence_speedup(
                 main_temp_dir,
             )
     else:
+        main_temp_dir = Path(temp_dir)
         return _process_video_with_temp_dir(
             input_video,
             output_video,
             percentile,
             silence_duration,
             speed_factor,
-            temp_dir,
+            main_temp_dir,
         )
 
 
 def _process_video_with_temp_dir(
-    input_video, output_video, percentile, silence_duration, speed_factor, temp_dir
+    input_video: Path,
+    output_video: Path,
+    percentile,
+    silence_duration,
+    speed_factor,
+    temp_dir: Path,
 ):
     """
     Internal function to process video with a given temporary directory.
     """
     try:
-        chunk_files = split_video(input_video, temp_dir=temp_dir)
+        chunk_files = split_video(
+            input_video, temp_dir=str(temp_dir)
+        )  # Pass temp_dir as string to split_video
 
-        processed_chunks = []
         for chunk_file in chunk_files:
             try:
                 # Calculate the noise threshold (percentile) using EBU R128 momentary loudness
@@ -497,7 +506,10 @@ def _process_video_with_temp_dir(
 
                         # Use a temporary file for the filter_complex in the main temp dir
                         with tempfile.NamedTemporaryFile(
-                            mode="w+t", delete=False, suffix=".txt", dir=temp_dir
+                            mode="w+t",
+                            delete=False,
+                            suffix=".txt",
+                            dir=str(temp_dir),  # Pass temp_dir as string to tempfile
                         ) as filter_complex_file:
                             filter_complex_file.write(
                                 filter_complex
@@ -505,35 +517,37 @@ def _process_video_with_temp_dir(
                             filter_complex_file_name = (
                                 filter_complex_file.name
                             )  # Capture name before closing
+                        filter_complex_file_path = Path(filter_complex_file_name)
 
                         # Use a temporary output file for the processed chunk in the same chunk directory
-                        temp_output_file = os.path.join(
-                            os.path.dirname(chunk_file),
-                            "temp_" + os.path.basename(chunk_file),
+                        temp_output_file = chunk_file.parent / (
+                            "temp_" + chunk_file.name
                         )
 
                         # Apply the filter_complex
                         command = [
                             "ffmpeg",
                             "-i",
-                            chunk_file,
+                            str(
+                                chunk_file
+                            ),  # Convert Path to string for ffmpeg command
                             "-filter_complex_script",
                             filter_complex_file_name,  # Use -filter_complex_script
                             "-map",
                             "[outv]",
                             "-map",
                             "[outa]",
-                            temp_output_file,
+                            str(
+                                temp_output_file
+                            ),  # Convert Path to string for ffmpeg command
                         ]
                         _run_ffmpeg_command(command)
 
                         # Replace original chunk with the processed one
-                        os.remove(chunk_file)
-                        os.rename(temp_output_file, chunk_file)
+                        chunk_file.unlink()
+                        temp_output_file.rename(chunk_file)
 
-                        os.remove(
-                            filter_complex_file_name
-                        )  # Clean up the temp filter file
+                        filter_complex_file_path.unlink()  # Clean up the temp filter file
 
                     else:
                         logging.info(f"No silence detected in {chunk_file}.")
