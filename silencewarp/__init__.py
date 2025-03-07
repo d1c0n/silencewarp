@@ -7,4 +7,5 @@ from .silencewarp import (  # noqa: F401
     merge_chunks,
     split_video,
     process_video_silence_speedup,
+    _run_ffmpeg_command,
 )
